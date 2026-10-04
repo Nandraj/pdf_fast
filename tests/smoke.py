@@ -44,6 +44,7 @@ def main() -> None:
             f.write(build_pdf(5))
 
         assert pdf_fast.page_count(src) == 5
+        assert pdf_fast.page_count(src, verify=True) == 5
 
         assert pdf_fast.extract_first_pages(src, dst, 2) == 2
         assert pdf_fast.page_count(dst) == 2
@@ -51,6 +52,15 @@ def main() -> None:
         # n larger than the document returns everything
         assert pdf_fast.extract_first_pages(src, dst, 99) == 5
         assert pdf_fast.page_count(dst) == 5
+
+        # limits raise PdfFastError and leave no partial output
+        small = os.path.join(d, "small.pdf")
+        try:
+            pdf_fast.extract_first_pages(src, small, 5, max_bytes=10)
+        except pdf_fast.PdfFastError:
+            assert not os.path.exists(small)
+        else:
+            raise AssertionError("expected PdfFastError for max_bytes")
 
         # bad input raises our exception, never crashes the interpreter
         bad = os.path.join(d, "bad.pdf")

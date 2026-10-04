@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pdf-fast"
-version = "0.1.0"
+version = "0.1.3"
 description = "Fast, low-memory PDF page count and first-N-page extraction (Rust)"
 readme = "README.md"
 requires-python = ">=3.9"

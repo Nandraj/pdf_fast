@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use memmap2::Mmap;
 use pdf::file::FileOptions;
@@ -40,12 +41,75 @@ fn map_file(path: &Path) -> Res<Mmap> {
     unsafe { Mmap::map(&f) }.map_err(e)
 }
 
+/// Cooperative time limit, checked between objects (cannot interrupt one parse).
+#[derive(Clone, Copy)]
+struct Deadline(Option<Instant>);
+impl Deadline {
+    fn new(secs: Option<f64>) -> Res<Self> {
+        match secs {
+            None => Ok(Deadline(None)),
+            Some(s) if s.is_finite() && s > 0.0 => Ok(Deadline(Some(Instant::now() + Duration::from_secs_f64(s)))),
+            Some(_) => Err("timeout must be a positive number of seconds".into()),
+        }
+    }
+    fn check(&self) -> Res<()> {
+        match self.0 {
+            Some(t) if Instant::now() > t => Err("timeout exceeded".into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Resolve the catalog's /Pages reference.
+fn pages_ref<R: Resolve>(r: &R, root_ref: PlainRef) -> Res<PlainRef> {
+    let root = as_dict(r.resolve(root_ref).map_err(e)?).ok_or("catalog is not a dictionary")?;
+    match root.get("Pages") {
+        Some(Primitive::Reference(p)) => Ok(*p),
+        _ => Err("catalog has no /Pages".into()),
+    }
+}
+
+/// Count leaf pages by walking the page tree (ignores the possibly-wrong /Count).
+fn count_leaves<R: Resolve>(r: &R, root: PlainRef, dl: Deadline) -> Res<u32> {
+    let mut stack = vec![(root, 0usize)];
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut n: u64 = 0;
+    while let Some((node, depth)) = stack.pop() {
+        dl.check()?;
+        if depth > 64 || !seen.insert((node.id as u64, node.gen as u64)) {
+            continue;
+        }
+        let Some(dict) = as_dict(r.resolve(node).map_err(e)?) else { continue };
+        match dict.get("Kids") {
+            Some(Primitive::Array(kids)) if !type_is(&dict, &["Page"]) => {
+                for k in kids {
+                    if let Primitive::Reference(kr) = k {
+                        stack.push((*kr, depth + 1));
+                    }
+                }
+            }
+            _ => n += 1,
+        }
+    }
+    u32::try_from(n).map_err(|_| "too many pages".into())
+}
+
 // ---------------------------------------------------------------- page count
 
-fn page_count_impl(path: &Path, password: &[u8]) -> Res<u32> {
+fn page_count_impl(path: &Path, password: &[u8], verify: bool, timeout: Option<f64>) -> Res<u32> {
+    let dl = Deadline::new(timeout)?;
     let mmap = map_file(path)?;
     let file = FileOptions::uncached().password(password).load(mmap).map_err(e)?;
-    Ok(file.num_pages())
+    if !verify {
+        return Ok(file.num_pages()); // trusts the root /Count: O(1)
+    }
+    let r = file.resolver();
+    let root = pages_ref(&r, file.trailer.root.get_ref().get_inner())?;
+    let n = count_leaves(&r, root, dl)?;
+    if n == 0 {
+        return Err("no pages found".into());
+    }
+    Ok(n)
 }
 
 // ---------------------------------------------------------------- extraction
@@ -240,18 +304,21 @@ impl<'a, R: Resolve> Copier<'a, R> {
     }
 }
 
-fn extract_impl(src: &Path, dst: &Path, n: u32, password: &[u8]) -> Res<u32> {
+fn extract_impl(
+    src: &Path,
+    dst: &Path,
+    n: u32,
+    password: &[u8],
+    max_bytes: Option<u64>,
+    timeout: Option<f64>,
+) -> Res<u32> {
+    let dl = Deadline::new(timeout)?;
     let mmap = map_file(src)?;
     let file = FileOptions::uncached().password(password).load(mmap).map_err(e)?;
     let r = file.resolver();
 
     // Locate the page tree via the raw catalog dictionary.
-    let root_ref = file.trailer.root.get_ref().get_inner();
-    let root = as_dict(r.resolve(root_ref).map_err(e)?).ok_or("catalog is not a dictionary")?;
-    let pages_ref = match root.get("Pages") {
-        Some(Primitive::Reference(p)) => *p,
-        _ => return Err("catalog has no /Pages".into()),
-    };
+    let pages_ref = pages_ref(&r, file.trailer.root.get_ref().get_inner())?;
 
     let mut selected = Vec::new();
     collect_pages(&r, pages_ref, &Dictionary::new(), &mut selected, n as usize, &mut HashSet::new(), 0)?;
@@ -286,6 +353,12 @@ fn extract_impl(src: &Path, dst: &Path, n: u32, password: &[u8]) -> Res<u32> {
 
     // FIFO processing == ascending id order, so offsets[] fills in order.
     while let Some((id, prim)) = c.queue.pop_front() {
+        dl.check()?;
+        if let Some(m) = max_bytes {
+            if w.pos > m {
+                return Err(format!("output exceeds max_bytes ({m})"));
+            }
+        }
         let pos = w.pos;
         if offsets.len() <= id as usize {
             offsets.resize(id as usize + 1, 0);
@@ -294,6 +367,12 @@ fn extract_impl(src: &Path, dst: &Path, n: u32, password: &[u8]) -> Res<u32> {
         write!(w, "{id} 0 obj\n").map_err(e)?;
         match prim {
             Primitive::Stream(s) => {
+                // Refuse oversized streams *before* reading them into memory.
+                if let (Some(m), Some(Primitive::Integer(l))) = (max_bytes, s.info.get("Length")) {
+                    if *l as i64 > 0 && (*l as u64) > m {
+                        return Err(format!("a stream ({l} bytes) exceeds max_bytes ({m})"));
+                    }
+                }
                 let data = s.raw_data(&r).map_err(e)?; // one stream at a time
                 let mut info = c.remap_dict(&s.info);
                 let len = i32::try_from(data.len()).map_err(|_| "stream too large")?;
@@ -339,29 +418,44 @@ fn guarded<T>(f: impl FnOnce() -> Res<T>) -> PyResult<T> {
 }
 
 /// Return the number of pages in the PDF at `path`.
+///
+/// By default this trusts the page tree's /Count (O(1)). With `verify=True` it
+/// walks the page tree and counts real pages, which is robust against files
+/// whose /Count is wrong. `timeout` is in seconds.
 #[pyfunction]
-#[pyo3(signature = (path, password=None))]
-fn page_count(py: Python<'_>, path: PathBuf, password: Option<Vec<u8>>) -> PyResult<u32> {
+#[pyo3(signature = (path, password=None, verify=false, timeout=None))]
+fn page_count(
+    py: Python<'_>,
+    path: PathBuf,
+    password: Option<Vec<u8>>,
+    verify: bool,
+    timeout: Option<f64>,
+) -> PyResult<u32> {
     let pw = password.unwrap_or_default();
-    py.detach(move || guarded(|| page_count_impl(&path, &pw)))
+    py.detach(move || guarded(|| page_count_impl(&path, &pw, verify, timeout)))
 }
 
 /// Write the first `n` pages of `src` to `dst`; returns pages written.
+///
+/// `max_bytes` caps the output size and rejects oversized streams before they
+/// are read; `timeout` (seconds) aborts long extractions. Both raise PdfFastError.
 #[pyfunction]
-#[pyo3(signature = (src, dst, n, password=None))]
+#[pyo3(signature = (src, dst, n, password=None, max_bytes=None, timeout=None))]
 fn extract_first_pages(
     py: Python<'_>,
     src: PathBuf,
     dst: PathBuf,
     n: u32,
     password: Option<Vec<u8>>,
+    max_bytes: Option<u64>,
+    timeout: Option<f64>,
 ) -> PyResult<u32> {
     if n == 0 {
         return Err(PyValueError::new_err("n must be >= 1"));
     }
     let pw = password.unwrap_or_default();
     py.detach(move || {
-        let res = guarded(|| extract_impl(&src, &dst, n, &pw));
+        let res = guarded(|| extract_impl(&src, &dst, n, &pw, max_bytes, timeout));
         if res.is_err() {
             let _ = std::fs::remove_file(&dst); // don't leave partial output
         }
